@@ -11,7 +11,6 @@ extern "C" {
 // 类型定义
 typedef struct
 {
-    // output params
     char *filename;
     int   usefd;
     int   valfd;
