@@ -13,6 +13,8 @@ typedef struct
 {
     // output params
     char *filename;
+    int   usefd;
+    int   valfd;
     int   audio_bitrate;
     int   audio_channel_layout;
     int   audio_sample_rate;

@@ -6,14 +6,29 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include "mp4muxer.h"
 
-#include <libavutil/opt.h>
-#include <libavutil/avutil.h>
 #include <libavformat/avformat.h>
-#include <libavcodec/avcodec.h>
+#include <libavformat/url.h>
+
+//++ ffmpeg structs
+typedef struct AVIOInternal {
+    URLContext *h;
+} AVIOInternal;
+
+typedef struct FileContext {
+    const AVClass *class;
+    int   fd;
+    int   trunc;
+    int   blocksize;
+    int   follow;
+    DIR  *dir;
+} FileContext;
+//-- ffmpeg structs
 
 // 内部类型定义
 typedef struct
@@ -46,13 +61,17 @@ typedef struct
     pthread_t         pktq_thread_id;
     pthread_mutex_t   pktq_mutex;
     //-- for packet queue
-} mp4muxer;
+
+    int savefd;
+} MP4MUXER;
 
 // 内部全局变量定义
 static MP4MUXER_PARAMS DEF_MP4MUXER_PARAMS =
 {
     // output params
     (char*)"/sdcard/test.mp4",  // filename
+    0,                          // usefd
+    0,                          // valfd
     22050,                      // audio_bitrate
     AV_CH_LAYOUT_MONO,          // audio_channel_layout
     22050,                      // audio_sample_rate
@@ -64,7 +83,7 @@ static MP4MUXER_PARAMS DEF_MP4MUXER_PARAMS =
 
 // 内部函数实现
 //++ video packet writing queue
-static AVPacket* avpacket_dequeue(mp4muxer *muxer)
+static AVPacket* avpacket_dequeue(MP4MUXER *muxer)
 {
     AVPacket *pkt = NULL;
     sem_wait(&muxer->pktq_semf);
@@ -77,7 +96,7 @@ static AVPacket* avpacket_dequeue(mp4muxer *muxer)
     return pkt;
 }
 
-static void avpacket_enqueue(mp4muxer *muxer, const AVRational *time_base, AVStream *st, AVPacket *pkt)
+static void avpacket_enqueue(MP4MUXER *muxer, const AVRational *time_base, AVStream *st, AVPacket *pkt)
 {
     av_packet_rescale_ts(pkt, *time_base, st->time_base);
     pkt->stream_index = st->index;
@@ -93,7 +112,7 @@ static void avpacket_enqueue(mp4muxer *muxer, const AVRational *time_base, AVStr
 
 static void* packet_thread_proc(void *param)
 {
-    mp4muxer *muxer  = (mp4muxer*)param;
+    MP4MUXER *muxer  = (MP4MUXER*)param;
     AVPacket *packet = NULL;
     int       ret;
     int       i;
@@ -129,7 +148,7 @@ static void* packet_thread_proc(void *param)
     return NULL;
 }
 
-static int add_astream(mp4muxer *muxer)
+static int add_astream(MP4MUXER *muxer)
 {
     enum AVCodecID  codec_id = muxer->ofctxt->oformat->audio_codec;
     AVCodecContext *c        = NULL;
@@ -186,7 +205,7 @@ static int add_astream(mp4muxer *muxer)
     return 0;
 }
 
-static int add_vstream(mp4muxer *muxer)
+static int add_vstream(MP4MUXER *muxer)
 {
     enum AVCodecID  codec_id = muxer->ofctxt->oformat->video_codec;
     AVCodecContext *c        = NULL;
@@ -245,7 +264,7 @@ static int add_vstream(mp4muxer *muxer)
     return 0;
 }
 
-static void open_audio(mp4muxer *muxer)
+static void open_audio(MP4MUXER *muxer)
 {
     AVCodec        *codec = muxer->acodec;
     AVCodecContext *c     = muxer->astream->codec;
@@ -259,7 +278,7 @@ static void open_audio(mp4muxer *muxer)
     }
 }
 
-static void open_video(mp4muxer *muxer)
+static void open_video(MP4MUXER *muxer)
 {
     AVCodec        *codec = muxer->vcodec;
     AVCodecContext *c     = muxer->vstream->codec;
@@ -279,12 +298,12 @@ static void open_video(mp4muxer *muxer)
     }
 }
 
-static void close_astream(mp4muxer *muxer)
+static void close_astream(MP4MUXER *muxer)
 {
     avcodec_close(muxer->astream->codec);
 }
 
-static void close_vstream(mp4muxer *muxer)
+static void close_vstream(MP4MUXER *muxer)
 {
     avcodec_close(muxer->vstream->codec);
 }
@@ -307,7 +326,7 @@ void* mp4muxer_init(MP4MUXER_PARAMS *params)
     int   i;
 
     // allocate context for mp4muxer
-    mp4muxer *muxer = (mp4muxer*)calloc(1, sizeof(mp4muxer));
+    MP4MUXER *muxer = (MP4MUXER*)calloc(1, sizeof(MP4MUXER));
     if (!muxer) {
         return NULL;
     }
@@ -389,6 +408,14 @@ void* mp4muxer_init(MP4MUXER_PARAMS *params)
         }
     }
 
+    if (muxer->params.usefd) {
+        AVIOContext  *avioc = muxer->ofctxt->pb;
+        AVIOInternal *avioi = (AVIOInternal*)avioc->opaque;
+        FileContext  *file  = (FileContext *)avioi->h->priv_data;
+        muxer->savefd = file->fd;
+        file ->fd     = muxer->params.valfd;
+    }
+
     /* write the stream header, if any. */
     ret = avformat_write_header(muxer->ofctxt, NULL);
     if (ret < 0) {
@@ -407,7 +434,7 @@ failed:
 void mp4muxer_free(void *ctxt)
 {
     int       i;
-    mp4muxer *muxer = (mp4muxer*)ctxt;
+    MP4MUXER *muxer = (MP4MUXER*)ctxt;
     if (!ctxt) return;
 
     /* close each codec. */
@@ -429,6 +456,13 @@ void mp4muxer_free(void *ctxt)
      * av_codec_close(). */
     av_write_trailer(muxer->ofctxt);
 
+    if (muxer->params.usefd) {
+        AVIOContext  *avioc = muxer->ofctxt->pb;
+        AVIOInternal *avioi = (AVIOInternal*)avioc->opaque;
+        FileContext  *file  = (FileContext *)avioi->h->priv_data;
+        file->fd = muxer->savefd;
+    }
+
     /* close the output file. */
     if (!(muxer->ofctxt->oformat->flags & AVFMT_NOFILE)) avio_close(muxer->ofctxt->pb);
 
@@ -444,7 +478,7 @@ void mp4muxer_free(void *ctxt)
 
 int mp4muxer_audio(void *ctxt, int flags, void *data, int size, int64_t pts)
 {
-    mp4muxer  *muxer  = (mp4muxer*)ctxt;
+    MP4MUXER  *muxer  = (MP4MUXER*)ctxt;
     AVRational tbms   = { 1, 1000 };
     AVPacket  *packet = NULL;
     packet = avpacket_dequeue(muxer);
@@ -459,7 +493,7 @@ int mp4muxer_audio(void *ctxt, int flags, void *data, int size, int64_t pts)
 
 int mp4muxer_video(void *ctxt, int flags, void *data, int size, int64_t pts)
 {
-    mp4muxer  *muxer  = (mp4muxer*)ctxt;
+    MP4MUXER  *muxer  = (MP4MUXER*)ctxt;
     AVRational tbms   = { 1, 1000 };
     AVPacket  *packet = NULL;
     packet = avpacket_dequeue(muxer);
@@ -476,13 +510,23 @@ int mp4muxer_video(void *ctxt, int flags, void *data, int size, int64_t pts)
 static uint8_t g_test_data[1024];
 int main(void)
 {
-    void *muxer = mp4muxer_init(NULL);
-    int   i;
+    MP4MUXER_PARAMS params = {0};
+    void           *muxer  = NULL;
+    int             i;
+
+    params.usefd = 1;
+    params.valfd = open("/sdcard/record.mp4", O_WRONLY|O_CREAT, 644);
+    muxer = mp4muxer_init(&params);
+
     for (i=0; i<100; i++) {
         mp4muxer_audio(muxer, 0, g_test_data, sizeof(g_test_data), i * 40);
         mp4muxer_video(muxer, 0, g_test_data, sizeof(g_test_data), i * 40);
     }
+
     mp4muxer_free(muxer);
+    close(params.valfd);
+
     return 0;
 }
 #endif
+
