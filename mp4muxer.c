@@ -507,7 +507,7 @@ int mp4muxer_video(void *ctxt, int flags, void *data, int size, int64_t pts)
 }
 
 #if TEST_MP4MUXER
-static uint8_t g_test_data[1024];
+static uint8_t g_test_data[1024] = {0};
 int main(void)
 {
     MP4MUXER_PARAMS params = {0};
@@ -518,7 +518,7 @@ int main(void)
     params.valfd = open("/sdcard/record.mp4", O_WRONLY|O_CREAT, 644);
     muxer = mp4muxer_init(&params);
 
-    for (i=0; i<100; i++) {
+    for (i=0; i<1000; i++) {
         mp4muxer_audio(muxer, 0, g_test_data, sizeof(g_test_data), i * 40);
         mp4muxer_video(muxer, 0, g_test_data, sizeof(g_test_data), i * 40);
     }
