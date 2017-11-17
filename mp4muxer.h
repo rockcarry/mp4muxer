@@ -1,5 +1,5 @@
-#ifndef __FFENCODER_H_
-#define __FFENCODER_H_
+#ifndef __MP4MUXER_H__
+#define __MP4MUXER_H__
 
 // 包含头文件
 #include <stdint.h>
