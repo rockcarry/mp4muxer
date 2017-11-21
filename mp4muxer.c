@@ -45,10 +45,10 @@ typedef struct
     int               have_video;
 
     #define MP4MUXER_TS_EXIT  (1 << 0)
-    int               thread_state;
+    int               thread_status;
 
     //++ for packet queue
-    #define PKT_QUEUE_SIZE 128
+    #define PKT_QUEUE_SIZE 128 // important!! must be power of 2
     AVPacket          pktq_b[PKT_QUEUE_SIZE]; // packets
     AVPacket         *pktq_f[PKT_QUEUE_SIZE]; // free packets queue
     AVPacket         *pktq_w[PKT_QUEUE_SIZE]; // used packets queue
@@ -59,7 +59,6 @@ typedef struct
     int               pktq_headw;
     int               pktq_tailw;
     pthread_t         pktq_thread_id;
-    pthread_mutex_t   pktq_mutex;
     //-- for packet queue
 
     int savefd;
@@ -87,12 +86,7 @@ static AVPacket* avpacket_dequeue(MP4MUXER *muxer)
 {
     AVPacket *pkt = NULL;
     sem_wait(&muxer->pktq_semf);
-    pthread_mutex_lock  (&muxer->pktq_mutex);
-    pkt = muxer->pktq_f[muxer->pktq_headf];
-    if (++muxer->pktq_headf == PKT_QUEUE_SIZE) {
-        muxer->pktq_headf = 0;
-    }
-    pthread_mutex_unlock(&muxer->pktq_mutex);
+    pkt = muxer->pktq_f[muxer->pktq_headf++ & (PKT_QUEUE_SIZE - 1)];
     return pkt;
 }
 
@@ -100,12 +94,7 @@ static void avpacket_enqueue(MP4MUXER *muxer, const AVRational *time_base, AVStr
 {
     av_packet_rescale_ts(pkt, *time_base, st->time_base);
     pkt->stream_index = st->index;
-    pthread_mutex_lock  (&muxer->pktq_mutex);
-    muxer->pktq_w[muxer->pktq_tailw] = pkt;
-    if (++muxer->pktq_tailw == PKT_QUEUE_SIZE) {
-        muxer->pktq_tailw = 0;
-    }
-    pthread_mutex_unlock(&muxer->pktq_mutex);
+    muxer->pktq_w[muxer->pktq_tailw++ & (PKT_QUEUE_SIZE - 1)] = pkt;
     sem_post(&muxer->pktq_semw);
 }
 //-- video packet writing queue
@@ -119,7 +108,7 @@ static void* packet_thread_proc(void *param)
 
     while (1) {
         if (0 != sem_trywait(&muxer->pktq_semw)) {
-            if (muxer->thread_state & MP4MUXER_TS_EXIT) {
+            if (muxer->thread_status & MP4MUXER_TS_EXIT) {
                 break;
             } else {
                 usleep(10*1000);
@@ -128,19 +117,13 @@ static void* packet_thread_proc(void *param)
         }
 
         // dequeue packet from pktq_w
-        packet = muxer->pktq_w[muxer->pktq_headw];
-        if (++muxer->pktq_headw == PKT_QUEUE_SIZE) {
-            muxer->pktq_headw = 0;
-        }
+        packet = muxer->pktq_w[muxer->pktq_headw++ & (PKT_QUEUE_SIZE - 1)];
 
         // write packet
         av_interleaved_write_frame(muxer->ofctxt, packet);
 
         // enqueue packet to pktq_f
-        muxer->pktq_f[muxer->pktq_tailf] = packet;
-        if (++muxer->pktq_tailf == PKT_QUEUE_SIZE) {
-            muxer->pktq_tailf = 0;
-        }
+        muxer->pktq_f[muxer->pktq_tailf++ & (PKT_QUEUE_SIZE - 1)] = packet;
 
         sem_post(&muxer->pktq_semf);
     }
@@ -382,7 +365,6 @@ void* mp4muxer_init(MP4MUXER_PARAMS *params)
     }
 
     // for packet queue
-    pthread_mutex_init(&muxer->pktq_mutex, NULL  );
     sem_init(&muxer->pktq_semf, 0, PKT_QUEUE_SIZE);
     sem_init(&muxer->pktq_semw, 0, 0             );
     for (i=0; i<PKT_QUEUE_SIZE; i++) {
@@ -441,9 +423,8 @@ void mp4muxer_free(void *ctxt)
     if (muxer->have_audio) close_astream(muxer);
     if (muxer->have_video) close_vstream(muxer);
 
-    muxer->thread_state |= MP4MUXER_TS_EXIT;
+    muxer->thread_status |= MP4MUXER_TS_EXIT;
     pthread_join(muxer->pktq_thread_id, NULL);
-    pthread_mutex_destroy(&muxer->pktq_mutex);
     sem_destroy(&muxer->pktq_semf);
     sem_destroy(&muxer->pktq_semw);
     for (i=0; i<PKT_QUEUE_SIZE; i++) {
