@@ -141,7 +141,7 @@ static int add_astream(MP4MUXER *muxer)
 
     muxer->acodec = avcodec_find_encoder(codec_id);
     if (!muxer->acodec) {
-        printf("could not find muxer for '%s'\n", avcodec_get_name(codec_id));
+        printf("could not find encoder for '%s'\n", avcodec_get_name(codec_id));
         return -1;
     }
 
@@ -197,7 +197,7 @@ static int add_vstream(MP4MUXER *muxer)
 
     muxer->vcodec = avcodec_find_encoder(codec_id);
     if (!muxer->vcodec) {
-        printf("could not find muxer for '%s'\n", avcodec_get_name(codec_id));
+        printf("could not find encoder for '%s'\n", avcodec_get_name(codec_id));
         return -1;
     }
 
